@@ -1,0 +1,492 @@
+"use client"
+
+import type React from "react"
+
+import { useEffect, useMemo, useState } from "react"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Badge } from "@/components/ui/badge"
+import { Label } from "@/components/ui/label"
+import { getJobs, type JobItem, resumeScoreByUrl, uploadResume } from "@/lib/api-client"
+import { loadResumes } from "@/lib/store"
+import Link from "next/link"
+
+import { logHistory } from "@/lib/history-store"
+
+type ScoredJob = JobItem & { score?: number }
+
+export default function JobsPage() {
+  const savedResumes = loadResumes()
+  const [resumeChoice, setResumeChoice] = useState<"saved" | "upload">("saved")
+  const [savedResumeId, setSavedResumeId] = useState<string | undefined>(savedResumes[0]?.id)
+  const [resumeUrl, setResumeUrl] = useState<string | null>(localStorage.getItem("uploaded-resume-url") || null)
+  const [uploading, setUploading] = useState(false)
+
+  const [query, setQuery] = useState("")
+  const [location, setLocation] = useState("")
+  const [remote, setRemote] = useState("any")
+  const [employmentType, setEmploymentType] = useState("all")
+  const [experienceLevel, setExperienceLevel] = useState("all")
+  const [currentPage, setCurrentPage] = useState(1)
+  const [jobs, setJobs] = useState<ScoredJob[]>([])
+  const [loading, setLoading] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
+  const [activeTab, setActiveTab] = useState<'search' | 'saved' | 'applied' | 'interviews' | 'offers' | 'rejected'>('search')
+  const [savedJobs, setSavedJobs] = useState<Record<string, JobItem>>({})
+  
+  // Load saved jobs from localStorage on component mount
+  useEffect(() => {
+    const savedJobsJson = localStorage.getItem('saved-jobs')
+    if (savedJobsJson) {
+      try {
+        setSavedJobs(JSON.parse(savedJobsJson))
+      } catch (e) {
+        console.error('Failed to parse saved jobs:', e)
+      }
+    }
+  }, [])
+
+  // If using saved resume, we don't have a URL; you can extend backend to render a PDF and return a URL.
+  // For now, we allow scoring only when uploaded URL exists.
+  const canScore = !!resumeUrl
+
+  async function onUploadResume(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    try {
+      setUploading(true)
+      const up = await uploadResume(file)
+      setResumeUrl(up.url)
+      localStorage.setItem("uploaded-resume-url", up.url)
+      logHistory({ type: "resume-upload", meta: { url: up.url, fileId: up.fileId, name: file.name } })
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : "Upload failed";
+      alert(errorMessage);
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function search(loadMore = false) {
+    setLoading(true)
+    try {
+      const page = loadMore ? currentPage + 1 : 1;
+      const params: Record<string, string | number | boolean> = { 
+        page,
+        num_pages: 1,
+        page_size: 15,
+        query, 
+        location
+      }
+      
+      if (remote === "remote") {
+        params.remote_jobs_only = true
+      }
+      
+      if (employmentType !== "all") {
+        params.employment_types = employmentType
+      }
+      
+      if (experienceLevel !== "all") {
+        params.job_requirements = experienceLevel
+      }
+      
+      const res = await getJobs(params)
+      
+      if (loadMore) {
+        setJobs(prevJobs => [...prevJobs, ...(res.data as ScoredJob[])])
+      } else {
+        setJobs(res.data as ScoredJob[])
+      }
+      
+      setCurrentPage(page)
+      setHasMore(res.data.length === 15) // Assume there's more if we got the full requested amount
+      logHistory({ type: "job-search", meta: { query, location, count: res.data.length } })
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : "Job search failed";
+      alert(errorMessage);
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // Save job to localStorage
+  function saveJob(job: JobItem) {
+    const newSavedJobs = {
+      ...savedJobs,
+      [job.job_id || `${job.job_title}-${Date.now()}`]: job
+    }
+    setSavedJobs(newSavedJobs)
+    localStorage.setItem('saved-jobs', JSON.stringify(newSavedJobs))
+    alert(`Job "${job.job_title}" saved successfully!`)
+    logHistory({ type: "job-save", meta: { job_title: job.job_title, employer: job.employer_name } })
+  }
+  
+  // Remove job from savedJobs
+  function removeJob(jobId: string) {
+    const newSavedJobs = { ...savedJobs }
+    delete newSavedJobs[jobId]
+    setSavedJobs(newSavedJobs)
+    localStorage.setItem('saved-jobs', JSON.stringify(newSavedJobs))
+  }
+  
+  async function scoreAll() {
+    if (!canScore) {
+      alert("Please upload a PDF resume to score jobs.")
+      return
+    }
+    // Limit concurrency to avoid overloading backend
+    const limit = 5
+    let index = 0
+    const results: ScoredJob[] = [...jobs]
+
+    async function worker() {
+      while (index < jobs.length) {
+        const i = index++
+        const job = jobs[i]
+        try {
+          const s = await resumeScoreByUrl(resumeUrl!, job.job_description || "")
+          let score: number | undefined
+          if (s.data.status === "completed") {
+            // Some APIs return score 0-10; normalize to 0-100 when value <= 10
+            const raw = s.data.score ?? 0
+            score = raw <= 10 ? Math.round(raw * 10) : Math.round(raw)
+          } else {
+            // quick poll once
+            await new Promise((r) => setTimeout(r, 2000))
+            // In a real app, call /api/status to finalize
+            score = undefined
+          }
+          results[i] = { ...job, score }
+          logHistory({ type: "job-score", meta: { job_title: job.job_title, score } })
+        } catch {
+          results[i] = { ...job, score: undefined }
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, () => worker()))
+    // Sort by score desc when available
+    results.sort((a, b) => (b.score ?? -1) - (a.score ?? -1))
+    setJobs(results)
+  }
+
+  const resumeHelp = useMemo(() => {
+    if (resumeChoice === "saved") {
+      return "Scoring requires an uploaded URL for now. Upload a PDF to enable backend scoring."
+    }
+    return resumeUrl ? "Ready to score job matches" : "Upload a PDF resume to enable scoring"
+  }, [resumeChoice, resumeUrl])
+
+  return (
+    <main className="container py-6 space-y-4">
+      <Card>
+        <CardHeader className="py-3">
+          <CardTitle className="text-lg">My Jobs</CardTitle>
+        </CardHeader>
+        <CardContent className="px-2 py-2">
+          <div className="flex flex-wrap gap-2">
+            <Button 
+              variant={activeTab === 'search' ? 'default' : 'outline'}
+              onClick={() => setActiveTab('search')}
+            >
+              Search Jobs
+            </Button>
+            <Button 
+              variant={activeTab === 'saved' ? 'default' : 'outline'}
+              onClick={() => setActiveTab('saved')}
+            >
+              Saved Jobs <span className="ml-1 text-xs opacity-80">({Object.keys(savedJobs).length})</span>
+            </Button>
+            <Button 
+              variant={activeTab === 'applied' ? 'default' : 'outline'}
+              onClick={() => setActiveTab('applied')}
+            >
+              Applied Jobs
+            </Button>
+            <Button 
+              variant={activeTab === 'interviews' ? 'default' : 'outline'}
+              onClick={() => setActiveTab('interviews')}
+            >
+              Interviews
+            </Button>
+            <Button 
+              variant={activeTab === 'offers' ? 'default' : 'outline'}
+              onClick={() => setActiveTab('offers')}
+            >
+              Offers
+            </Button>
+            <Button 
+              variant={activeTab === 'rejected' ? 'default' : 'outline'}
+              onClick={() => setActiveTab('rejected')}
+            >
+              Rejected
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+      
+      <div className="space-y-4">
+        {activeTab === 'search' && (
+          <>
+            <Card>
+              <CardHeader>
+                <CardTitle>Choose Resume Source</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Select value={resumeChoice} onValueChange={(v: "saved" | "upload") => setResumeChoice(v)}>
+                    <SelectTrigger className="w-[200px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="saved">CareerCraft Resume</SelectItem>
+                      <SelectItem value="upload">Upload PDF</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {resumeChoice === "saved" ? (
+                    <>
+                      <Select value={savedResumeId} onValueChange={setSavedResumeId}>
+                        <SelectTrigger className="w-[240px]">
+                          <SelectValue placeholder="Select resume" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {savedResumes.map((r) => (
+                            <SelectItem key={r.id} value={r.id!}>
+                              {r.title || "Untitled Resume"}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Badge variant="outline" className="ml-1">
+                        {resumeHelp}
+                      </Badge>
+                    </>
+                  ) : (
+                    <>
+                      <Input type="file" accept=".pdf" onChange={onUploadResume} disabled={uploading} />
+                      {resumeUrl ? (
+                        <Badge className="bg-green-600">Uploaded</Badge>
+                      ) : (
+                        <Badge variant="outline">{resumeHelp}</Badge>
+                      )}
+                    </>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Search Jobs</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="job-title">Job Title/Keywords:</Label>
+                    <Input 
+                      id="job-title"
+                      placeholder="e.g. Frontend Developer" 
+                      value={query} 
+                      onChange={(e) => setQuery(e.target.value)} 
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="job-location">Location:</Label>
+                    <Input 
+                      id="job-location"
+                      placeholder="e.g. Bangalore" 
+                      value={location} 
+                      onChange={(e) => setLocation(e.target.value)} 
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="employment-type">Employment Type:</Label>
+                    <Select value={employmentType} onValueChange={setEmploymentType}>
+                      <SelectTrigger id="employment-type">
+                        <SelectValue placeholder="Select employment type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All Types</SelectItem>
+                        <SelectItem value="FULLTIME">Full-time</SelectItem>
+                        <SelectItem value="PARTTIME">Part-time</SelectItem>
+                        <SelectItem value="CONTRACTOR">Contract</SelectItem>
+                        <SelectItem value="INTERN">Internship</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="experience-level">Experience Level:</Label>
+                    <Select value={experienceLevel} onValueChange={setExperienceLevel}>
+                      <SelectTrigger id="experience-level">
+                        <SelectValue placeholder="Select experience level" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All Levels</SelectItem>
+                        <SelectItem value="no_experience">Entry Level</SelectItem>
+                        <SelectItem value="under_3_years_experience">Mid Level</SelectItem>
+                        <SelectItem value="more_than_3_years_experience">Senior Level</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                
+                <div className="flex items-center">
+                  <Select value={remote} onValueChange={setRemote}>
+                    <SelectTrigger className="w-[180px]">
+                      <SelectValue placeholder="Remote options" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="any">Any Location</SelectItem>
+                      <SelectItem value="remote">Remote Jobs Only</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                
+                <div className="flex gap-3">
+                  <Button onClick={() => search(false)} disabled={loading} className="min-w-[100px]">
+                    {loading ? "Searching..." : "Search"}
+                  </Button>
+                  <Button variant="outline" onClick={scoreAll} disabled={!canScore || jobs.length === 0}>
+                    Score Matches
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {jobs.length === 0 ? (
+              <div className="text-center p-8">
+                <p className="text-lg font-medium">No jobs to display</p>
+                <p className="text-muted-foreground">Enter search terms above and click &quot;Search&quot; to find jobs</p>
+              </div>
+            ) : (
+              <>
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {jobs.map((job, idx) => (
+                  <Card key={`${job.job_title}-${idx}`}>
+                    <CardHeader className="pb-2">
+                      <CardTitle className="text-base flex items-center justify-between">
+                        <span className="truncate">{job.job_title}</span>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-2">
+                      <div className="text-sm">{job.employer_name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {job.job_city ? `${job.job_city}, ` : ""}
+                        {job.job_state ? `${job.job_state}, ` : ""}
+                        {job.job_country || ""}
+                        {job.job_is_remote ? " • Remote" : ""}
+                      </div>
+                      <div className="text-xs line-clamp-4">{job.job_description}</div>
+                      <div className="flex gap-2 pt-2">
+                        {job.job_apply_link && (
+                          <Button asChild size="sm">
+                            <a href={job.job_apply_link} target="_blank" rel="noreferrer">
+                              Apply
+                            </a>
+                          </Button>
+                        )}
+                        <Button variant="outline" size="sm" onClick={() => saveJob(job)}>
+                          Save
+                        </Button>
+                        {job.job_id && (
+                          <Button asChild variant="outline" size="sm">
+                            <a href={`/dashboard/jobs/${job.job_id}`} target="_blank" rel="noreferrer">
+                              Details
+                            </a>
+                          </Button>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                  ))}
+                </div>
+                
+                {hasMore && (
+                  <div className="flex justify-center mt-6">
+                    <Button variant="outline" onClick={() => search(true)} disabled={loading}>
+                      {loading ? "Loading..." : "Load More Jobs"}
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+
+        {activeTab === 'saved' && (
+          <>
+            <Card>
+              <CardHeader>
+                <CardTitle>My Saved Jobs</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Jobs you&apos;ve saved will appear here. You can apply or remove them from your saved list.
+                </p>
+              </CardContent>
+            </Card>
+            
+            {Object.keys(savedJobs).length === 0 ? (
+              <div className="text-center p-8">
+                <p className="text-lg font-medium">No saved jobs</p>
+                <p className="text-muted-foreground">Search for jobs and click the Save button to add them here</p>
+              </div>
+            ) : (
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {Object.entries(savedJobs).map(([jobId, job]) => (
+                <Card key={jobId}>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-base flex items-center justify-between">
+                      <span className="truncate">{job.job_title}</span>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    <div className="text-sm">{job.employer_name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {job.job_city ? `${job.job_city}, ` : ""}
+                      {job.job_state ? `${job.job_state}, ` : ""}
+                      {job.job_country || ""}
+                      {job.job_is_remote ? " • Remote" : ""}
+                    </div>
+                    <div className="text-xs line-clamp-4">{job.job_description}</div>
+                    <div className="flex gap-2 pt-2">
+                      {job.job_apply_link && (
+                        <Button asChild size="sm">
+                          <a href={job.job_apply_link} target="_blank" rel="noreferrer">
+                            Apply
+                          </a>
+                        </Button>
+                      )}
+                      <Button variant="outline" size="sm" onClick={() => removeJob(jobId)}>
+                        Remove
+                      </Button>
+                      {job.job_id && (
+                        <Button asChild variant="outline" size="sm">
+                          <a href={`/dashboard/jobs/${job.job_id}`} target="_blank" rel="noreferrer">Details</a>
+                        </Button>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {(activeTab === 'applied' || activeTab === 'interviews' || activeTab === 'offers' || activeTab === 'rejected') && (
+          <div className="text-center p-8">
+            <p className="text-lg font-medium">Coming Soon</p>
+            <p className="text-muted-foreground">This feature will be available in future updates</p>
+          </div>
+        )}
+        
+        <p className="text-xs text-muted-foreground">Upload a PDF to score job matches using your backend.</p>
+      </div>
+    </main>
+  )
+}
